@@ -1,0 +1,358 @@
+#!/usr/bin/env bash
+
+#===============================================================================
+# Name: ddn-external-checkers
+# Version: 22.11.1
+# Purpose: Checker for DDN SFA Storage Controllers and Object Storage Systems (OSS)
+#===============================================================================
+
+#===============================================================================
+# Function: Help
+#===============================================================================
+help() {
+	cat >&1 <<- eof
+Usage: "$(basename "${BASH_SOURCE[0]}")" -noderange-es NODERANGE -noderange-sfa NODERANGE -system NAME
+
+Options:
+  -noderange-es NODERANGE     xCAT Noderange for EXAScaler Targets
+  -noderange-sfa NODERANGE    xCAT Noderange for SFA Targets
+  -system NAME                SFA System Name
+
+eof
+	exit 0
+}
+
+#===============================================================================
+# Function: Log Event
+#===============================================================================
+readonly LOGGER_LEVEL_TRACE=0 LOGGER_LEVEL_DEBUG=1 LOGGER_LEVEL_INFO=2 LOGGER_LEVEL_WARN=3 LOGGER_LEVEL_ERROR=4 LOGGER_LEVEL_FATAL=5
+readonly LOGGER_LEVELS=("TRACE" "DEBUG" "INFO" "WARN" "ERROR" "FATAL")
+logger::event-log() {
+	while (( $# > 0 )); do
+		case "${1}" in
+			-level)
+				local -i level="${2}"
+				shift
+				;;
+			-message)
+				local message="${2}"
+				shift
+				;;
+		esac
+		shift
+	done
+	if (( level == LOGGER_LEVEL_FATAL )); then
+		printf "[%26s] [%-5s] %s\n" "$(date "+%Y-%m-%d %H:%M:%S %:z")" "${LOGGER_LEVELS[${LOGGER_LEVEL_CRIT}]}" "${message:-Undefined Exception} @ ${FUNCNAME[1]}:${BASH_LINENO[0]}"
+		exit 1
+	fi
+	if (( level >= LOG_LEVEL )); then
+		printf "[%26s] [%-5s] %s\n" "$(date "+%Y-%m-%d %H:%M:%S %:z")" "${LOGGER_LEVELS[${level}]}" "${message}" &>>"${DDN_CHECKER_LOGFILE}"
+	fi
+	return 0
+}
+
+#===============================================================================
+# Environment: DDN Checker
+#===============================================================================
+readonly DDN_CHECKER_PREFIX="$(realpath "$(dirname "${BASH_SOURCE[0]}")"/..)"
+readonly DDN_CHECKER_LOGDIR="${DDN_CHECKER_PREFIX}/var/log"
+readonly DDN_CHECKER_RUNDIR="${DDN_CHECKER_PREFIX}/var/run"
+readonly DDN_CHECKER_LOGFILE="${DDN_CHECKER_LOGDIR}/ddn-checker.log"
+
+#===============================================================================
+# Environment: Logger
+#===============================================================================
+readonly LOG_LEVEL="${LOGGER_LEVEL_WARN}"
+
+#===============================================================================
+# Environment: SFA OS
+#===============================================================================
+SFA_CLUI_USER_DEFAULT="user"
+
+#===============================================================================
+# Environment: sudo
+#===============================================================================
+readonly SUDO_EXECBIN="/usr/bin/sudo"
+
+#===============================================================================
+# Environment: xCAT
+#===============================================================================
+readonly XCAT_DSH_EXECBIN="/opt/xcat/bin/xdsh"
+readonly XCAT_NODELS_EXECBIN="/opt/xcat/bin/nodels"
+
+#===============================================================================
+# Function: DDN ES Checker | collectd
+#===============================================================================
+ddn-es-checker::collectd() {
+	printf "collectd: status=%s\n" "$(systemctl is-active collectd.service)"
+	return 0
+}
+
+#===============================================================================
+# Function: DDN ES Checker | Connection to MGS
+#===============================================================================
+ddn-es-checker::connection-to-mgs() {
+	local date_pattern && date_pattern="$(date +"%b %e")"
+	local lost && lost="$(awk '/Connection to MGS.*was lost/' /var/log/lustre.log | grep -c "${date_pattern}")"
+	printf "connection-to-mgs: lost=%s\n" "${lost}"
+	return 0
+}
+
+#===============================================================================
+# Function: DDN ES Checker | Degraded
+#===============================================================================
+ddn-es-checker::degraded() {
+	local degraded
+	local ost
+	local -a array
+	while read -r ost degraded; do
+		array+=("${ost}=${degraded}")
+	done < <(lctl get_param obdfilter.*.degraded 2>/dev/null | awk 'match($0, /^obdfilter.(.*).degraded=([01])$/, a) {printf "%s %s\n", a[1], a[2]}')
+	printf "%s: " "degraded"
+	IFS="," printf "%s\n" "${array[*]}"
+	printf "\n"
+	return 0
+}
+
+#===============================================================================
+# Function: DDN ES Checker | Filesystems
+#===============================================================================
+ddn-es-checker::filesystems() {
+	local use_percent_root && use_percent_root="$(df --human-readable | awk 'match($0, /^.* ([0-9]+)%\s*\/$/, a) {printf "%u", a[1]}')"
+	local use_percent_var && use_percent_var="$(df --human-readable | awk 'match($0, /^.* ([0-9]+)%\s*\/var$/, a) {printf "%u", a[1]}')"
+	printf "filesystems: fs-root=%s;fs-var=%s\n" "${use_percent_root}" "${use_percent_var}"
+	return 0
+}
+
+#===============================================================================
+# Function: DDN ES Checker | HA Resources
+#===============================================================================
+ddn-es-checker::ha-resources() {
+	local resources_configured && resources_configured="$(hastatus | awk 'match($0, /^([0-9]+)\s*resource instances configured$/, a) {printf "%u", a[1]}')"
+	local resources_disabled && resources_disabled="$(hastatus | awk 'match($0, /^[0-9]+ resource instances configured \(([0-9]+) DISABLED\)$/, a) {printf "%u", a[1]}')"
+	printf "ha-resources: configured=%s;disabled=%s\n" "${resources_configured}" "${resources_disabled}"
+	return 0
+}
+
+#===============================================================================
+# Function: DDN ES Checker | High CPU Load
+#===============================================================================
+ddn-es-checker::high_cpu_load() {
+	local date_pattern_start && date_pattern_start="$(date --date="-15 min" +"%b %e %H:%M")"
+	local date_pattern_end && date_pattern_end="$(date +"%b %e %H:%M")"
+	awk 'BEGIN {count=0; max=0; total=0} /'"${date_pattern_start}"'/,/'"${date_pattern_end}"'/ && match($0, /notice:\s*High CPU load detected:\s*([\.0-9]+)\s*$/, a) {if (a[1]>max) {max=a[1]}; total+=a[1]; count+=1} END {if (count==0) {avg=0} else {avg=total/count}; printf "%s: avg=%i;max=%i;count=%i\n", "high_cpu_load", avg, max, count}' "/var/log/messages"
+	return 0
+}
+
+#===============================================================================
+# Function: DDN ES Checker | MB C3 Threshold
+#===============================================================================
+ddn-es-checker::mb_c3_threshold() {
+	local volume
+	while read -r volume; do
+		if [[ -n "${volume}" ]]; then
+			local thresholds
+			thresholds+=("${volume}=$(cat "/sys/fs/ldiskfs/${volume}/mb_c3_threshold")")
+		fi
+	done < <(find /sys/fs/ldiskfs/*/mb_c3_threshold -type f 2>/dev/null | awk 'match($0, /^\/sys\/fs\/ldiskfs\/(.*)\/mb_c3_threshold$/, a) {print a[1]}')
+	printf "%s: " "mb_c3_threshold"
+	IFS="," printf "%s\n" "${thresholds[*]}"
+	return 0
+}
+
+#===============================================================================
+# Function: DDN ES Checker | Uptime
+#===============================================================================
+ddn-es-checker::uptime() {
+	local uptime && uptime="$(awk '{printf("%1d", $1)}' /proc/uptime)"
+	printf "uptime: uptime=%s;since=%s\n" "${uptime}" "$(uptime --since)"
+	return 0
+}
+
+#===============================================================================
+# Function: DDN SFA Checker | Primary Controller Filter
+#===============================================================================
+opcm::ddn-sfa::primary-controller-filter() {
+	local array
+	read -a array -r < <(${SUDO} ${XCAT_DSH_EXECBIN} "${noderange_sfa}" --devicetype "DDN::SFA" --user="${SFA_CLUI_USER_DEFAULT}" "show controller local" 2>/dev/null | awk 'match($0, /^(.+):.+PRIMARY/, a) {print a[1]}' | sort -u)
+	noderange_sfa_filtered="$(IFS="," printf "%s\n" "${array[*]}")"
+	return 0
+}
+
+#===============================================================================
+# Function: DDN SFA Checker | Position Status
+#===============================================================================
+ddn-sfa-checker::position-status() {
+	local host
+	local position_status
+	while read -r host position_status; do
+		if [[ "${host}" != "${host_previous}" ]]; then
+			if [[ -n "${host_previous}" ]]; then
+				printf "\n"
+			fi
+			printf "%s: position-status: " "${host}"
+			local -i index=0
+		else
+			printf ","
+		fi
+		position_status="${position_status##* }"
+		position_status="${position_status,,}"
+		printf "%s=%s" "${index}" "${position_status}"
+		(( index += 1 ))
+		local host_previous="${host}"
+	done < <(${SUDO} ${XCAT_DSH_EXECBIN} "${noderange_sfa_filtered}" --devicetype "DDN::SFA" --user="${SFA_CLUI_USER_DEFAULT}" "show enclosure all" 2>/dev/null | awk 'match($0, /^(.*): Position Status:\s*(.*)$/, a) {print a[1] " "  a[2]}' | sort)
+	printf "\n"
+	return 0
+}
+
+#===============================================================================
+# Function: DDN SFA Checker | SCSI Events
+#===============================================================================
+ddn-sfa-checker::scsi-events() {
+	local shift
+	local date_of_the_day
+	for shift in $(seq 0 1 4); do
+		date_of_the_day[${shift}]="$(date --date="-${shift} days" +%Y-%m-%d)"
+	done
+	local tmpfile="${DDN_CHECKER_RUNDIR}/show_controller_local_log.${system}.out"
+	local date_start && date_start="$(date --date="-5 days" +"%Y-%m-%d")"
+	local date_end && date_end="$(date --date="+1 day" +"%Y-%m-%d")"
+	${SUDO} ${XCAT_DSH_EXECBIN} "${noderange_sfa}" --devicetype "DDN::SFA" --user="${SFA_CLUI_USER_DEFAULT}" "show controller local log number 5000"  2>/dev/null | awk '/'"${date_start}"'/,/'"${date_end}"'/' &>"${tmpfile}"
+	local node
+	while read -r node; do
+		printf "%s: %s: " "${node}" "scsi-events"
+		local scsi_events=()
+		for shift in $(seq 0 1 4); do
+			if (( shift > 0 )); then printf ","; fi
+			scsi_events[${shift}]="$(awk 'BEGIN {count=0} /'"${node}"':.*'"${date_of_the_day[${shift}]}"'.*LOG_AMPD.*/ {count+=1} END {print count}' "${tmpfile}")"
+			printf "%s=%s" "${date_of_the_day[${shift}]}" "${scsi_events[${shift}]}"
+		done
+		printf "\n"
+	done < <(${SUDO} ${XCAT_NODELS_EXECBIN} "${noderange_sfa}" 2>/dev/null | sort)
+	return 0
+}
+
+#===============================================================================
+# Function: DDN SFA Checker | Write Back
+#===============================================================================
+ddn-sfa-checker::write-back() {
+	local host
+	local write_back
+	while read -r host write_back; do
+		if [[ "${host}" != "${host_previous}" ]]; then
+			if [[ -n "${host_previous}" ]]; then
+				printf "\n"
+			fi
+			printf "%s: write-back: " "${host}"
+			local -i index=0
+		else
+			printf ","
+		fi
+		printf "%s=%s" "${index}" "${write_back,,}"
+		(( index += 1 ))
+		local host_previous="${host}"
+	done < <(${SUDO} ${XCAT_DSH_EXECBIN} "${noderange_sfa_filtered}" --devicetype "DDN::SFA" --user="${SFA_CLUI_USER_DEFAULT}" "show virtual_disk * all_attributes" 2>/dev/null | awk 'match($0, /^(.*):.*Write Back\s*:\s*(.*)$/, a) {print a[1] " " a[2]}' | sort)
+	printf "\n"
+	return 0
+}
+
+#===============================================================================
+# Arguments Parsing
+#===============================================================================
+while (( $# > 0 )); do
+	case "${1}" in
+		-help|-h)
+			help
+			;;
+		-noderange-es)
+			noderange_es="${2}"
+			shift
+			;;
+		-noderange-sfa)
+			noderange_sfa="${2}"
+			shift
+			;;
+		-system)
+			system="${2}"
+			shift
+			;;
+		*)
+			break
+			;;
+	esac
+	shift
+done
+
+
+#===============================================================================
+# Prolog
+#===============================================================================
+logger::event-log -level "${LOGGER_LEVEL_DEBUG}" -message "Starting DDN External Checkers"
+# Non-Root Execution User
+if (( EUID > 0 )); then
+	logger::event-log -level "${LOGGER_LEVEL_DEBUG}" -message "Effective User ID: [${EUID}] - Using sudo to Call xCAT Commands"
+	SUDO="${SUDO_EXECBIN}"
+	if [[ -f "/etc/profile.d/xcat.sh" ]]; then
+		if source "/etc/profile.d/xcat.sh" &>/dev/null; then
+			logger::event-log -level "${LOGGER_LEVEL_DEBUG}" -message "Sourced xCAT Profile"
+		else
+			logger::event-log -level "${LOGGER_LEVEL_DEBUG}" -message "Failed to Source xCAT Profile"
+		fi
+	fi
+fi
+# Validation: Noderange EXAScaler
+if [[ -n "${noderange_es}" ]] && ! ${SUDO} ${XCAT_NODELS_EXECBIN} "${noderange_es}" &>/dev/null; then
+	logger::event-log -level "${LOGGER_LEVEL_FATAL}" -message "Invalid Noderange: [${noderange_es}]"
+	exit 1
+fi
+# Validation: Noderange SFA
+if [[ -n "${noderange_sfa}" ]] && ! ${SUDO} ${XCAT_NODELS_EXECBIN} "${noderange_sfa}" &>/dev/null; then
+	logger::event-log -level "${LOGGER_LEVEL_FATAL}" -message "Invalid Noderange: [${noderange_sfa}]"
+	exit 1
+fi
+
+#===============================================================================
+# Data Collection
+#===============================================================================
+if [[ -n "${system}" ]]; then
+	outfile="${DDN_CHECKER_LOGDIR}/${system}.log"
+	rm --force "${outfile}"
+	if [[ -n "${noderange_sfa}" ]]; then
+		opcm::ddn-sfa::primary-controller-filter -noderange "${noderange_sfa}" -noderange-filtered "noderange_sfa_filtered"
+		# Position Status
+		ddn-sfa-checker::position-status >>"${outfile}"
+		# SCSI Events
+		ddn-sfa-checker::scsi-events >>"${outfile}"
+		# Write Back
+		ddn-sfa-checker::write-back >>"${outfile}"
+	fi
+	if [[ -n "${noderange_es}" ]]; then
+		${SUDO} ${XCAT_DSH_EXECBIN} "${noderange_es}" --execute "$(realpath "${BASH_SOURCE[0]}")" | sort >>"${outfile}"
+	fi
+else
+	if [[ -z "${noderange_es}" ]]; then
+		# collectd
+		ddn-es-checker::collectd
+		# Connection to MGS
+		ddn-es-checker::connection-to-mgs
+		# Degraded
+		ddn-es-checker::degraded
+		# Filesystems
+		ddn-es-checker::filesystems 
+		# HA Resources
+		ddn-es-checker::ha-resources 
+		# High CPU Load
+		ddn-es-checker::high_cpu_load 
+		# MB C3 Threshold
+		ddn-es-checker::mb_c3_threshold 
+		# Uptime
+		ddn-es-checker::uptime 
+	fi
+fi
+
+#===============================================================================
+# Epilog
+#===============================================================================
+logger::event-log -level "${LOGGER_LEVEL_DEBUG}" -message "Stopping DDN External Checkers"
+
+exit 0
